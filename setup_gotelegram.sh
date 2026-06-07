@@ -374,7 +374,7 @@ Docker образ '$DOCKER_IMAGE' не смог его создать.
 
 validate_tg_link() {
     local link=$1
-    if [[ ! "$link" =~ ^tg://proxy\?server=[a-zA-Z0-9.-]+&port=[0-9]+&secret=[0-9a-f]{64}$ ]]; then
+    if [[ ! "$link" =~ ^tg://proxy\?server=[a-zA-Z0-9.-]+\&port=[0-9]+\&secret=[0-9a-f]{64}$ ]]; then
         return 1
     fi
     return 0
