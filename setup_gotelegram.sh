@@ -361,7 +361,7 @@ generate_secret() {
                 if command -v openssl &>/dev/null; then
                     random_part=$(openssl rand -hex 4 2>/dev/null | tr -d '\n\r')
                 else
-                    random_part=$(dd if=/dev/urandom bs=4 count=1 2>/dev/null | xxd -p -c 8 | tr -d '\n\r')
+                    random_part=$(dd if=/dev/urandom bs=4 count=1 2>/dev/null | xxd -p -c 8 2>/dev/null | tr -d '\n\r')
                 fi
                 secret="${secret}${random_part}"
             fi
@@ -387,7 +387,7 @@ generate_secret() {
 
 Попробуйте:
 1. docker pull $DOCKER_IMAGE
-2. Выберите другой домен
+2. Выберите другой домен (google.com, wikipedia.org)
 3. Проверьте интернет соединение"
 }
 
@@ -450,6 +450,7 @@ menu_install() {
     clear
     echo -e "${MAGENTA}=== Установка MTProto Proxy ===${NC}\n"
 
+    # Проверка существующего прокси
     if docker ps 2>/dev/null | grep -q "$DOCKER_CONTAINER_NAME"; then
         echo -e "${YELLOW}Внимание: прокси уже установлен!${NC}"
         read -r -p "Переустановить? (y/n): " reinstall || true
@@ -460,11 +461,12 @@ menu_install() {
         stop_and_remove_container
     fi
 
+    # Выбор домена для маскировки
     echo -e "${CYAN}--- Выберите домен для маскировки (Fake TLS) ---${NC}"
     local domains=(
         "google.com" "wikipedia.org" "github.com" "cloudflare.com"
         "microsoft.com" "amazon.com" "yahoo.com" "duckduckgo.com"
-        "apple.com" "vaihe.org"
+        "apple.com" "meta.com"
     )
 
     for i in "${!domains[@]}"; do
@@ -498,6 +500,7 @@ menu_install() {
         fi
     done
 
+    # Выбор порта
     echo -e "\n${CYAN}--- Выберите порт ---${NC}"
     echo -e "1) 443 (Рекомендуется)"
     echo -e "2) 8443"
@@ -528,12 +531,14 @@ menu_install() {
         esac
     done
 
+    # Проверка доступности порта
     if ! check_port_available "$port"; then
         echo -e "${YELLOW}Порт занят, выберите другой порт${NC}"
         read -r -p "Нажмите Enter чтобы продолжить..." || true
         return
     fi
 
+    # Генерация секрета
     info "Генерация секрета для домена $domain..."
     local secret
     secret=$(generate_secret "$domain")
@@ -541,40 +546,94 @@ menu_install() {
         error_exit "Не удалось сгенерировать секрет!"
     fi
 
+    # Дополнительная проверка длины секрета
+    if [[ ${#secret} -ne 64 ]]; then
+        warning "Секрет имеет длину ${#secret}, дополняем до 64 символов..."
+        while [[ ${#secret} -lt 64 ]]; do
+            secret="${secret}0"
+        done
+        secret="${secret:0:64}"
+        info "Секрет исправлен: ${#secret} символов"
+    fi
+
+    # Запуск прокси
     info "Запуск прокси на порту $port..."
     local temp_log
     temp_log=$(mktemp)
     register_temp "$temp_log"
 
-    if docker run -d \
+    # Запускаем контейнер с проверкой
+    local container_id=""
+    container_id=$(docker run -d \
         --name "$DOCKER_CONTAINER_NAME" \
         --restart always \
         -p "$port:$port" \
         "$DOCKER_IMAGE" \
-        simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:"$port" "$secret" > "$temp_log" 2>&1; then
+        simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:"$port" "$secret" 2>&1 | tee "$temp_log")
 
-        success "Прокси успешно запущен"
+    # Проверяем, успешно ли создан контейнер
+    if [[ -n "$container_id" ]] && echo "$container_id" | grep -qE '^[0-9a-f]{64}$'; then
+        success "Прокси успешно запущен (ID: ${container_id:0:12})"
         sleep 3
 
-        if ! docker ps 2>/dev/null | grep -q "$DOCKER_CONTAINER_NAME"; then
-            echo -e "${RED}Контейнер запустился, но не работает!${NC}"
-            docker logs "$DOCKER_CONTAINER_NAME" --tail 20 || true
-            docker rm -f "$DOCKER_CONTAINER_NAME" &>/dev/null || true
+        # Проверяем, что контейнер действительно работает
+        local container_status
+        container_status=$(docker inspect --format='{{.State.Status}}' "$DOCKER_CONTAINER_NAME" 2>/dev/null || echo "not_found")
+
+        if [[ "$container_status" == "running" ]]; then
+            success "Контейнер работает в штатном режиме"
+        else
+            echo -e "${RED}Контейнер создан, но не работает (статус: $container_status)${NC}"
+            echo -e "${YELLOW}Логи контейнера:${NC}"
+            docker logs "$DOCKER_CONTAINER_NAME" --tail 20 2>/dev/null || echo "Логи недоступны"
+            echo -e "${YELLOW}Логи установки:${NC}"
+            cat "$temp_log" 2>/dev/null || true
+            read -r -p "Удалить проблемный контейнер? (y/n): " remove_broken || true
+            if [[ "$remove_broken" == "y" ]]; then
+                docker rm -f "$DOCKER_CONTAINER_NAME" &>/dev/null || true
+                info "Контейнер удален"
+            fi
             read -r -p "Нажмите Enter..." || true
             return
         fi
     else
         echo -e "${RED}Ошибка запуска прокси!${NC}"
-        echo -e "${YELLOW}Логи ошибки:${NC}"
-        cat "$temp_log" || true
-        docker rm -f "$DOCKER_CONTAINER_NAME" &>/dev/null || true
-        read -r -p "Нажмите Enter..." || true
+        echo -e "${YELLOW}Детали ошибки:${NC}"
+        cat "$temp_log" 2>/dev/null || true
+
+        # Дополнительная диагностика
+        echo -e "\n${YELLOW}Диагностика:${NC}"
+        echo "  Порт: $port"
+        echo "  Домен: $domain"
+        echo "  Длина секрета: ${#secret}"
+
+        # Проверка, не создался ли контейнер с ошибкой
+        if docker ps -a --format '{{.Names}}' | grep -q "^${DOCKER_CONTAINER_NAME}$"; then
+            echo -e "${YELLOW}Обнаружен проблемный контейнер, удаляем...${NC}"
+            docker rm -f "$DOCKER_CONTAINER_NAME" &>/dev/null || true
+        fi
+
+        read -r -p "Нажмите Enter чтобы продолжить..." || true
         return
     fi
 
+    # Показ конфигурации
     clear
     show_config
+
+    # Проверка работоспособности
+    echo -e "\n${CYAN}--- Проверка работоспособности ---${NC}"
+    local test_result
+    test_result=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "http://localhost:$port" 2>/dev/null || echo "000")
+
+    if [[ "$test_result" != "000" ]]; then
+        success "Прокси отвечает на порту $port (HTTP код: $test_result)"
+    else
+        warning "Прокси не отвечает на порту $port, но может работать с MTProto протоколом"
+    fi
+
     echo -e "\n${GREEN}✓ Установка завершена!${NC}"
+    echo -e "${CYAN}Для просмотра логов используйте: sudo $ALIAS_NAME logs${NC}"
     read -r -p "Нажмите Enter..." || true
 }
 
