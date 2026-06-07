@@ -353,47 +353,43 @@ generate_secret() {
     local max_attempts=3
 
     for ((i=1; i<=max_attempts; i++)); do
-        secret=$(docker run --rm "$DOCKER_IMAGE" generate-secret --hex "$domain" 2>/dev/null | tr -d '\n\r' || true)
-        if [[ -n "$secret" ]]; then
-            # MTG образ возвращает 56 символов, добавляем 8 случайных символов (4 байта)
-            if [[ ${#secret} -eq 56 ]]; then
-                local random_part=""
-                # Генерируем 4 байта (8 hex символов) случайных данных
-                if command -v openssl &>/dev/null; then
-                    random_part=$(openssl rand -hex 4 2>/dev/null | tr -d '\n\r')
-                else
-                    # Fallback через /dev/urandom
-                    random_part=$(dd if=/dev/urandom bs=4 count=1 2>/dev/null | xxd -p -c 8 2>/dev/null | tr -d '\n\r')
-                    if [[ -z "$random_part" ]]; then
-                        # Последний fallback
-                        random_part=$(cat /dev/urandom | tr -dc 'a-f0-9' | head -c 8 2>/dev/null)
+        # Генерируем секрет через mtg
+        if secret=$(docker run --rm "$DOCKER_IMAGE" generate-secret --hex "$domain" 2>/dev/null | tr -d '\n\r' | tr '[:upper:]' '[:lower:]'); then
+            # Проверяем, что секрет не пустой
+            if [[ -n "$secret" ]]; then
+                # Проверяем, что секрет начинается с 'ee' (Fake TLS префикс)
+                if [[ "$secret" =~ ^ee[0-9a-f]+$ ]]; then
+                    # Проверяем минимальную длину (34 символа для домена из 0 символов)
+                    if [[ ${#secret} -ge 34 ]]; then
+                        # Секрет валиден! НЕ модифицируем его!
+                        echo "$secret"
+                        return 0
+                    else
+                        warning "Секрет слишком короткий (${#secret} символов), попытка $i/$max_attempts"
                     fi
+                else
+                    warning "Секрет не начинается с 'ee', попытка $i/$max_attempts"
                 fi
-                secret="${secret}${random_part}"
-                info "Секрет дополнен случайными данными (было 56, стало 64 символа)"
-            fi
-
-            # Проверяем, что теперь 64 символа И секрет не содержит нулей в конце (кроме случайных)
-            if [[ ${#secret} -eq 64 ]] && [[ "$secret" =~ ^ee[0-9a-f]{62}$ ]]; then
-                # Дополнительная проверка: секрет не должен заканчиваться на 8+ нулей подряд
-                if [[ "$secret" =~ 00000000$ ]]; then
-                    warning "Секрет заканчивается на нули, регенерируем..."
-                    continue
-                fi
-                echo "$secret"
-                return 0
             fi
         fi
         sleep 1
     done
 
-    error_exit "Не удалось сгенерировать корректный Fake TLS секрет для домена '$domain'.
+    # Если все попытки неудачны
+    error_exit "Не удалось сгенерировать Fake TLS секрет для домена '$domain' после $max_attempts попыток.
+
+Возможные причины:
+1. Docker образ '$DOCKER_IMAGE' не поддерживает Fake TLS
+2. Домен '$domain' некорректен
+3. Проблемы с Docker или интернетом
 
 Попробуйте:
-1. docker pull $DOCKER_IMAGE
-2. Выберите другой домен (google.com, wikipedia.org)
-3. Проверьте интернет соединение"
+1. Обновить образ: docker pull $DOCKER_IMAGE
+2. Выбрать другой домен (google.com, wikipedia.org, github.com)
+3. Проверить, что Docker запущен: systemctl status docker"
 }
+
+
 validate_tg_link() {
     local link=$1
     if [[ ! "$link" =~ ^tg://proxy\?server=[a-zA-Z0-9.-]+\&port=[0-9]+\&secret=[0-9a-f]{64}$ ]]; then
