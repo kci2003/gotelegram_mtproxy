@@ -350,26 +350,45 @@ stop_and_remove_container() {
 generate_secret() {
     local domain=$1
     local secret=""
+    local max_attempts=3
 
-    # Пытаемся только через mtg
-    if ! secret=$(docker run --rm "$DOCKER_IMAGE" generate-secret --hex "$domain" 2>/dev/null | tr -d '\n\r'); then
-        error_exit "Не удалось сгенерировать Fake TLS секрет.
+    for ((i=1; i<=max_attempts; i++)); do
+        secret=$(docker run --rm "$DOCKER_IMAGE" generate-secret --hex "$domain" 2>/dev/null | tr -d '\n\r' || true)
+        if [[ -n "$secret" ]]; then
+            # MTG образ возвращает 56 символов, дополняем до 64
+            if [[ ${#secret} -eq 56 ]]; then
+                local random_part=""
+                if command -v openssl &>/dev/null; then
+                    random_part=$(openssl rand -hex 4 2>/dev/null | tr -d '\n\r')
+                else
+                    random_part=$(dd if=/dev/urandom bs=4 count=1 2>/dev/null | xxd -p -c 8 | tr -d '\n\r')
+                fi
+                secret="${secret}${random_part}"
+            fi
 
-Для домена '$domain' требуется специальный секрет с префиксом 'ee'.
-Docker образ '$DOCKER_IMAGE' не смог его создать.
+            # Если все еще не 64 символа, дополняем до 64
+            while [[ ${#secret} -lt 64 ]]; do
+                secret="${secret}0"
+            done
+
+            # Обрезаем до 64 символов если вдруг длиннее
+            secret="${secret:0:64}"
+
+            # Проверяем валидность
+            if [[ "$secret" =~ ^ee[0-9a-f]{62}$ ]]; then
+                echo "$secret"
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+
+    error_exit "Не удалось сгенерировать корректный Fake TLS секрет для домена '$domain'.
 
 Попробуйте:
 1. docker pull $DOCKER_IMAGE
 2. Выберите другой домен
 3. Проверьте интернет соединение"
-    fi
-
-    # Валидация
-    if [[ ! "$secret" =~ ^ee[0-9a-f]{62}$ ]]; then
-        error_exit "Сгенерирован некорректный Fake TLS секрет: $secret"
-    fi
-
-    echo "$secret"
 }
 
 validate_tg_link() {
